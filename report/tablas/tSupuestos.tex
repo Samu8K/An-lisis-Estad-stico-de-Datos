@@ -1,0 +1,18 @@
+\begin{tabular}{lp{3.4cm}p{5.3cm}l}
+\toprule
+Modelo & Supuesto & Evidencia & Conclusión \\
+\midrule
+ANOVA & Normalidad de residuos & Shapiro-Wilk (n = 5.000): p = 0,006 & No se cumple \\
+ANOVA & Homogeneidad de varianzas & Levene p = 0,452; Bartlett p = 0,367 & Se cumple \\
+ANOVA & Independencia & Un registro por cliente (ID único) & Se asume por diseño \\
+Lineal & Normalidad de residuos & Shapiro-Wilk (n = 5.000): p = 0,032 & No se cumple \\
+Lineal & Homocedasticidad & Breusch-Pagan: p = 0,331 & Se cumple \\
+Lineal & Independencia de errores & Durbin-Watson = 2,003 (p = 0,704) & Se cumple \\
+Lineal & Linealidad / especificación & RESET: p = 0,294 & Se cumple \\
+Lineal & Ausencia de multicolinealidad & GVIF^(1/2gl) máx. = 1,000 (umbral 2,24) & Se cumple \\
+Logístico & Eventos por parámetro & Eventos por parámetro = 16.554 (regla: 10) & Se cumple \\
+Logístico & Ausencia de multicolinealidad & GVIF^(1/2gl) máx. = 1,000 (umbral 2,24) & Se cumple \\
+Logístico & Linealidad del logit & RV términos cuadráticos: p = 0,872 & Se cumple \\
+Logístico & Observaciones influyentes & Cook máx. = 0,00009 & Se cumple \\
+\bottomrule
+\end{tabular}

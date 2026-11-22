@@ -1,0 +1,622 @@
+---
+title: "Código del análisis: compromiso y actividad de clientes bancarios"
+output:
+  html_document:
+    df_print: paged
+    theme: cosmo
+date: "2026-11-22"
+params:
+  archivo: "bank_data.csv"
+  alpha: 0.05
+  semilla: 2026
+  guardar_base: true
+---
+
+<!--
+SOLO CÓDIGO, TABLAS Y GRÁFICAS. Todo el texto e interpretaciones están en Informe_Final.tex.
+Al hacer Knit se crean junto a este archivo:
+   figs/       gráficas (.png)
+   tablas/     tablas en formato LaTeX (.tex)
+   resultados.tex   números y frases condicionales que Informe_Final.tex usa como \rNombre
+   bank_data_definitiva.csv   base definitiva (entregable)
+Luego compilar Informe_Final.tex con XeLaTeX (Overleaf: Menú > Compilador > XeLaTeX) en la MISMA carpeta.
+Paquetes: rmarkdown, knitr, broom, car, corrplot, dplyr, ggplot2, moments, readr, scales, tibble, tidyr.
+-->
+
+## Librerías, parámetros y funciones auxiliares
+
+```{r setup}
+library(broom); library(car); library(corrplot); library(dplyr); library(ggplot2)
+library(knitr); library(moments); library(readr); library(scales); library(tibble); library(tidyr)
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 7, fig.height = 4, fig.align = "center")
+options(scipen = 999, OutDec = ",")
+set.seed(params$semilla)
+ALPHA <- params$alpha
+dir.create("figs", showWarnings = FALSE); dir.create("tablas", showWarnings = FALSE)
+
+# ---- Formateadores (coma decimal, punto de miles) ----
+fmt  <- function(x, d = 2) ifelse(is.na(x), "NA", formatC(x, format = "f", digits = d, big.mark = ".", decimal.mark = ","))
+fp   <- function(p) ifelse(is.na(p), "NA", ifelse(p < 0.001, "<0,001", formatC(p, format = "f", digits = 3, decimal.mark = ",")))
+fpct <- function(x, d = 1) paste0(fmt(x, d), "%")
+lista <- function(v) if (length(v) == 0) "ninguna variable" else paste(v, collapse = ", ")
+lab_V   <- function(v) ifelse(v < .1, "despreciable", ifelse(v < .3, "pequeño", ifelse(v < .5, "moderado", "grande")))
+lab_d   <- function(d) ifelse(abs(d) < .2, "despreciable", ifelse(abs(d) < .5, "pequeño", ifelse(abs(d) < .8, "moderado", "grande")))
+lab_eta <- function(e) ifelse(e < .01, "despreciable", ifelse(e < .06, "pequeño", ifelse(e < .14, "mediano", "grande")))
+
+COL1 <- "#4C78A8"; COL2 <- "#E45756"; COL3 <- "#F2CF5B"
+theme_set(theme_minimal(base_size = 11))
+lbl_num <- label_number(big.mark = ".", decimal.mark = ",")
+
+# ---- Exportación hacia LaTeX ----
+# 1) Números y frases: mac("rNombre", valor) -> \rNombre en el .tex (solo letras en el nombre)
+MAC <- list()
+mac <- function(nombre, valor) {
+  stopifnot(!grepl("[^A-Za-z]", nombre))
+  MAC[[nombre]] <<- gsub("([%&#_$])", "\\\\\\1", paste(as.character(valor), collapse = " "))
+  invisible(NULL)
+}
+# 2) Tablas: tabla(df, "tNombre", spec) escribe tablas/tNombre.tex (tabular con booktabs) y la muestra aquí
+esc <- function(x) { x <- as.character(x); x[is.na(x)] <- ""
+  for (ch in c("&", "%", "$", "#", "_")) x <- gsub(ch, paste0("\\", ch), x, fixed = TRUE); x }
+tabla <- function(df, nombre, spec = NULL) {
+  df <- as.data.frame(df, stringsAsFactors = FALSE, check.names = FALSE)
+  nc <- ncol(df); if (is.null(spec)) spec <- paste0("l", strrep("r", nc - 1))
+  filas <- vapply(seq_len(nrow(df)), function(i) paste0(paste(esc(unlist(df[i, ])), collapse = " & "), " \\\\"), "")
+  L <- c(paste0("\\begin{tabular}{", spec, "}"), "\\toprule", paste0(paste(esc(names(df)), collapse = " & "), " \\\\"),
+         "\\midrule", filas, "\\bottomrule", "\\end{tabular}")
+  writeLines(L, file.path("tablas", paste0(nombre, ".tex")), useBytes = FALSE)
+  knitr::kable(df, caption = nombre)
+}
+# 3) Figuras: fig(p, "fNombre", ancho, alto) guarda figs/fNombre.png y la muestra aquí
+fig <- function(p, nombre, w = 6, h = 3.6) {
+  ggsave(file.path("figs", paste0(nombre, ".png")), p, width = w, height = h, dpi = 200)
+  p
+}
+```
+
+## Lectura de la base de datos
+
+```{r lectura}
+archivo <- params$archivo
+if (!file.exists(archivo)) {
+  cand <- list.files(pattern = "bank.*\\.csv", ignore.case = TRUE, full.names = TRUE, recursive = TRUE)
+  if (length(cand) == 0) cand <- list.files(pattern = "\\.csv", ignore.case = TRUE, full.names = TRUE, recursive = TRUE)
+  if (length(cand) > 0) archivo <- cand[1] else if (interactive()) archivo <- file.choose() else
+    stop("No se encontró ningún .csv en: ", getwd())
+}
+cat("Leyendo:", normalizePath(archivo), "\n")
+dataFrame <- read_csv(archivo, na = c("", "NA", "NaN", "null", "NULL"),
+                      col_types = cols(.default = col_guess(), Is_Active = col_character()))
+head(dataFrame, 100)
+```
+
+## Preparación de la base de datos
+
+```{r prep}
+n_raw    <- nrow(dataFrame)
+dup_id   <- sum(duplicated(dataFrame$ID))
+dup_fila <- sum(duplicated(dataFrame[, setdiff(names(dataFrame), "ID")]))
+
+datos <- dataFrame %>%
+  distinct(ID, .keep_all = TRUE) %>%
+  mutate(
+    Age = as.numeric(Age), Salary = as.numeric(Salary), Engagement_Score = as.numeric(Engagement_Score),
+    Gender = factor(trimws(Gender)), City = factor(trimws(City)),
+    Subscription_Tier = factor(trimws(Subscription_Tier), levels = c("Basic", "Premium", "Pro")),
+    act_txt = toupper(trimws(Is_Active)),
+    Estado = factor(case_when(is.na(act_txt) ~ NA_character_,
+                              act_txt %in% c("TRUE", "T", "1", "YES", "SI") ~ "Activo", TRUE ~ "Inactivo"),
+                    levels = c("Inactivo", "Activo")),
+    Act = as.integer(Estado == "Activo"),
+    Engagement_c = pmin(pmax(Engagement_Score, 0), 100)
+  ) %>% select(-act_txt)
+
+n_dat <- nrow(datos)
+n_neg <- sum(datos$Engagement_Score < 0, na.rm = TRUE)
+n_gt  <- sum(datos$Engagement_Score > 100, na.rm = TRUE)
+mu0 <- mean(datos$Engagement_Score, na.rm = TRUE); sd0 <- sd(datos$Engagement_Score, na.rm = TRUE)
+n_val <- sum(!is.na(datos$Engagement_Score))
+esp_fuera <- n_val * (pnorm(0, mu0, sd0) + 1 - pnorm(100, mu0, sd0))
+
+mu_e <- mean(datos$Engagement_c, na.rm = TRUE); sd_e <- sd(datos$Engagement_c, na.rm = TRUE)
+datos <- datos %>%
+  mutate(
+    Age_Group = cut(Age, breaks = c(17, 29, 44, 59, Inf), labels = c("18-29", "30-44", "45-59", "60 o más")),
+    Salary_Level = cut(Salary, breaks = c(-Inf, 60000, 90000, 120000, Inf),
+                       labels = c("Hasta 60 mil", "60-90 mil", "90-120 mil", "Más de 120 mil")),
+    Engagement_Level = cut(Engagement_c, breaks = c(-Inf, mu_e - sd_e, mu_e + sd_e, Inf), labels = c("Bajo", "Medio", "Alto"))
+  )
+
+an <- datos %>%
+  filter(!is.na(Age), !is.na(Salary), !is.na(Engagement_c), !is.na(Gender), !is.na(City),
+         !is.na(Subscription_Tier), !is.na(Estado)) %>%
+  droplevels() %>% mutate(Age10 = Age / 10, Sal10k = Salary / 10000, Eng10 = Engagement_c / 10)
+n_an <- nrow(an)
+
+m100 <- datos %>% slice_sample(n = min(n_dat, 100000))
+m5k  <- an %>% slice_sample(n = min(n_an, 5000))
+if (isTRUE(params$guardar_base)) write_csv(datos, "bank_data_definitiva.csv", na = "")
+
+fuera_txt <- ifelse(abs((n_neg + n_gt) - esp_fuera) <= 0.25 * esp_fuera,
+  "cifra compatible con la observada: se interpretan como colas de la distribución y no como errores de captura",
+  "cifra distinta de la observada: no se explican solo como colas de la distribución y requieren revisión con la fuente")
+mac("rNraw", fmt(n_raw, 0)); mac("rNdat", fmt(n_dat, 0)); mac("rNan", fmt(n_an, 0))
+mac("rPctAn", fpct(100 * n_an / n_dat)); mac("rDupId", fmt(dup_id, 0)); mac("rDupFila", fmt(dup_fila, 0))
+mac("rNneg", fmt(n_neg, 0)); mac("rNgt", fmt(n_gt, 0)); mac("rMuZero", fmt(mu0, 1)); mac("rSdZero", fmt(sd0, 1))
+mac("rEspFuera", fmt(esp_fuera, 0)); mac("rFueraTxt", fuera_txt); mac("rNfuera", fmt(n_neg + n_gt, 0))
+mac("rNmil", fmt(floor(n_dat / 1e5) * 1e5, 0))
+cat("Registros:", n_raw, "| IDs duplicados:", dup_id, "| Clientes:", n_dat, "| Casos completos:", n_an, "\n")
+```
+
+```{r tFaltantes}
+vars_na <- c("Age", "Salary", "Engagement_Score", "City", "Gender", "Subscription_Tier", "Estado")
+etq <- c(Age = "Edad", Salary = "Salario", Engagement_Score = "Engagement Score", City = "Ciudad",
+         Gender = "Género", Subscription_Tier = "Nivel de suscripción", Estado = "Estado de actividad")
+tab_na <- tibble(Variable = vars_na,
+                 n_na = sapply(vars_na, function(v) sum(is.na(datos[[v]]))),
+                 p_mcar = sapply(vars_na, function(v) {
+                   m <- is.na(datos[[v]])
+                   if (sum(m) == 0 || sum(!m) == 0 || v == "Estado") return(NA_real_)
+                   suppressWarnings(chisq.test(table(m, datos$Estado))$p.value) })) %>%
+  mutate(pct = 100 * n_na / n_dat)
+tn <- tab_na %>% filter(n_na > 0) %>%
+  transmute(Variable = unname(etq[Variable]), Faltantes = fmt(n_na, 0), Porcentaje = fpct(pct), `p (faltante vs. estado)` = fp(p_mcar))
+mac("rFaltMax", fpct(max(tab_na$pct), 0))
+tabla(tn, "tFaltantes")
+```
+
+## Descriptivo: variables cualitativas
+
+```{r tFreq}
+vars_cual <- c(Gender = "Género", City = "Ciudad", Subscription_Tier = "Suscripción", Estado = "Estado de actividad",
+               Age_Group = "Grupo de edad", Salary_Level = "Nivel salarial", Engagement_Level = "Nivel de engagement")
+freq_tab <- bind_rows(lapply(names(vars_cual), function(v) {
+  t <- table(datos[[v]])
+  data.frame(Variable = vars_cual[[v]], Categoria = names(t), n = as.integer(t), pct = 100 * as.numeric(t) / sum(t), stringsAsFactors = FALSE) }))
+fq <- function(v, cat) freq_tab$pct[freq_tab$Variable == v & freq_tab$Categoria == cat]
+ft <- freq_tab %>% mutate(Variable = ifelse(duplicated(Variable), "", Variable)) %>%
+  transmute(Variable, `Categoría` = Categoria, `Frecuencia absoluta` = fmt(n, 0), `Frecuencia relativa` = fpct(pct))
+tabla(ft, "tFreq", "llrr")
+
+unif <- max(abs(c(freq_tab$pct[freq_tab$Variable == "Género"] - 100 / 3, freq_tab$pct[freq_tab$Variable == "Ciudad"] - 100 / 8))) < 1
+mac("rUnifTxt", ifelse(unif, "prácticamente uniforme en género y ciudad", "con diferencias moderadas entre categorías de género y ciudad"))
+mac("rPctBasic", fpct(fq("Suscripción", "Basic"))); mac("rPctActivo", fpct(fq("Estado de actividad", "Activo")))
+mac("rClaseAct", ifelse(fq("Estado de actividad", "Activo") > 50, "mayoritaria", "minoritaria"))
+```
+
+```{r fCualitativas}
+barra_freq <- function(d, v, titulo, horizontal = FALSE) {
+  t <- d %>% filter(!is.na(.data[[v]])) %>% mutate(cat = .data[[v]]) %>% count(cat, name = "n") %>%
+    mutate(pct = 100 * n / sum(n), etiqueta = paste0(fmt(n, 0), " (", fmt(pct, 1), "%)"))
+  if (horizontal) t <- t %>% mutate(cat = reorder(cat, n))
+  g <- ggplot(t, aes(x = cat, y = n, fill = cat)) + geom_col(show.legend = FALSE) +
+    geom_text(aes(label = etiqueta), vjust = if (horizontal) 0.5 else -0.4, hjust = if (horizontal) -0.05 else 0.5, size = 2.8) +
+    scale_fill_viridis_d(end = 0.85) + scale_y_continuous(labels = lbl_num, expand = expansion(mult = c(0, .25))) +
+    labs(title = titulo, x = NULL, y = "Frecuencia")
+  if (horizontal) g <- g + coord_flip()
+  g
+}
+estado_counts <- datos %>% filter(!is.na(Estado)) %>% count(Estado) %>% mutate(percentage = n / sum(n) * 100)
+fig(ggplot(estado_counts, aes(x = "", y = n, fill = Estado)) + geom_bar(stat = "identity") + coord_polar(theta = "y") +
+      geom_text(aes(label = paste0(round(percentage, 1), "%")), position = position_stack(vjust = 0.5)) +
+      labs(title = "Estado de actividad") + theme_void() + scale_fill_manual(values = c(Inactivo = COL3, Activo = COL1)),
+    "fEstado", 3.4, 3)
+fig(barra_freq(datos, "Subscription_Tier", "Nivel de suscripción"), "fTier", 3.4, 3)
+fig(barra_freq(datos, "Gender", "Género"), "fGender", 3.4, 3)
+fig(barra_freq(datos, "City", "Ciudad", TRUE), "fCity", 3.4, 3)
+fig(barra_freq(datos, "Age_Group", "Grupo de edad"), "fAgeGroup", 3.4, 3)
+fig(barra_freq(datos, "Salary_Level", "Nivel salarial"), "fSalLevel", 3.4, 3)
+fig(barra_freq(datos, "Engagement_Level", "Nivel de engagement"), "fEngLevel", 3.4, 3)
+```
+
+## Descriptivo: cualitativas frente al estado de actividad
+
+```{r fCualBiv}
+lab_biv <- c(Gender = "Género", City = "Ciudad", Subscription_Tier = "Suscripción",
+             Age_Group = "Grupo de edad", Salary_Level = "Nivel salarial", Engagement_Level = "Nivel de engagement")
+nom_fig <- c(Gender = "fBivGender", City = "fBivCity", Subscription_Tier = "fBivTier",
+             Age_Group = "fBivAge", Salary_Level = "fBivSal", Engagement_Level = "fBivEng")
+for (v in names(lab_biv)) {
+  g <- ggplot(datos %>% filter(!is.na(.data[[v]]), !is.na(Estado)), aes(x = .data[[v]], fill = Estado)) +
+    geom_bar(position = "fill") + scale_y_continuous(labels = scales::percent) +
+    scale_fill_manual(values = c(Inactivo = COL3, Activo = COL1)) +
+    labs(title = paste("Actividad según", tolower(lab_biv[[v]])), x = NULL, y = "Porcentaje", fill = "Estado") +
+    theme(axis.text.x = element_text(angle = if (v == "City") 40 else 0, hjust = if (v == "City") 1 else 0.5, size = 8))
+  print(fig(g, nom_fig[[v]], 3.4, 3))
+}
+res_chi <- bind_rows(lapply(names(lab_biv), function(v) {
+  tt <- table(datos[[v]], datos$Estado); ct <- suppressWarnings(chisq.test(tt)); pa <- prop.table(tt, 1)[, "Activo"]
+  data.frame(Variable = lab_biv[[v]], gl = unname(ct$parameter), chi2 = unname(ct$statistic), p = ct$p.value,
+             V = sqrt(unname(ct$statistic) / (sum(tt) * (min(dim(tt)) - 1))), pmin = 100 * min(pa), pmax = 100 * max(pa), stringsAsFactors = FALSE) }))
+```
+
+## Descriptivo: variables cuantitativas
+
+```{r tCuant}
+moda <- function(x, dg = 0) { x <- round(x[!is.na(x)], dg); ux <- unique(x); ux[which.max(tabulate(match(x, ux)))] }
+estadigrafos <- function(x, dg = 0) {
+  x <- x[!is.na(x)]
+  c(n = length(x), Media = mean(x), Mediana = median(x), `Moda (redondeada)` = moda(x, dg), Rango = diff(range(x)),
+    Varianza = var(x), `Desviación estándar` = sd(x), `Coef. de variación (%)` = 100 * sd(x) / mean(x),
+    Q1 = unname(quantile(x, .25)), Q3 = unname(quantile(x, .75)), Mínimo = min(x), Máximo = max(x),
+    `Coef. de asimetría` = skewness(x), `Curtosis (normal = 3)` = kurtosis(x)) }
+qd <- cbind(Edad = estadigrafos(datos$Age, 0), Salario = estadigrafos(datos$Salary, -3), Engagement = estadigrafos(datos$Engagement_Score, 0))
+sk <- c(Age = skewness(datos$Age, na.rm = TRUE), Salary = skewness(datos$Salary, na.rm = TRUE), Eng = skewness(datos$Engagement_Score, na.rm = TRUE))
+qd_df <- data.frame(Estadístico = rownames(qd), Edad = fmt(qd[, 1], 2), Salario = fmt(qd[, 2], 2), Engagement = fmt(qd[, 3], 2))
+tabla(qd_df, "tCuant")
+
+mac("rMeanAge", fmt(mean(datos$Age, na.rm = TRUE), 1)); mac("rCvAge", fmt(qd["Coef. de variación (%)", "Edad"], 1))
+mac("rMeanSal", fmt(mean(datos$Salary, na.rm = TRUE), 0)); mac("rCvSal", fmt(qd["Coef. de variación (%)", "Salario"], 1))
+mac("rSkAge", fmt(sk["Age"], 2)); mac("rSkSal", fmt(sk["Salary"], 2)); mac("rSkEng", fmt(sk["Eng"], 2))
+mac("rFormaTxt", ifelse(max(abs(sk[c("Age", "Salary")])) < 0.1, "aproximadamente uniforme y simétrica, atípica para ingresos reales", "con cierta asimetría"))
+mac("rMeanEng", fmt(mean(datos$Engagement_Score, na.rm = TRUE), 1)); mac("rCvEng", fmt(qd["Coef. de variación (%)", "Engagement"], 1))
+mac("rEngFormaTxt", ifelse(abs(sk["Eng"]) < 0.3, "se aproxima a una campana", "presenta asimetría"))
+```
+
+```{r fCuant}
+vq <- c(Age = "Edad (años)", Salary = "Salario (USD)", Engagement_Score = "Engagement Score")
+long <- m100 %>% select(all_of(names(vq))) %>% pivot_longer(everything(), names_to = "var", values_to = "valor") %>%
+  filter(!is.na(valor)) %>% mutate(var = factor(var, levels = names(vq), labels = unname(vq)))
+fig(ggplot(long, aes(x = valor)) + geom_histogram(aes(y = after_stat(density)), bins = 30, fill = COL1, colour = "white") +
+      geom_density(colour = COL2, linewidth = 0.9) + facet_wrap(~var, scales = "free") + scale_x_continuous(labels = lbl_num) +
+      labs(title = "Histogramas con densidad", x = NULL, y = "Densidad") + theme(axis.text.y = element_blank()), "fHist", 7, 2.8)
+fig(ggplot(long, aes(x = valor)) + geom_boxplot(fill = COL3, outlier.size = 0.4, outlier.alpha = 0.3) +
+      facet_wrap(~var, scales = "free_x") + scale_x_continuous(labels = lbl_num) +
+      labs(title = "Diagramas de caja", x = NULL, y = NULL) + theme(axis.text.y = element_blank()), "fBox", 7, 2.4)
+```
+
+## Descriptivo: variables cuantitativas bivariadas
+
+```{r fCuantBiv}
+nom_q <- c(Age = "Edad", Salary = "Salario", Engagement_c = "Engagement")
+pares <- list(c("Age", "Engagement_c"), c("Salary", "Engagement_c"), c("Age", "Salary"))
+nom_sc <- c("fScatAgeEng", "fScatSalEng", "fScatAgeSal")
+for (i in seq_along(pares)) { p <- pares[[i]]
+  print(fig(ggplot(m5k, aes(x = .data[[p[1]]], y = .data[[p[2]]])) + geom_point(alpha = 0.3, size = 0.5, color = "darkblue") +
+              geom_smooth(method = "lm", formula = y ~ x, color = "red", se = FALSE) +
+              scale_x_continuous(labels = lbl_num) + scale_y_continuous(labels = lbl_num) +
+              labs(title = paste(nom_q[[p[1]]], "vs.", tolower(nom_q[[p[2]]])), x = nom_q[[p[1]]], y = nom_q[[p[2]]]),
+            nom_sc[i], 3.4, 3)) }
+
+cor_matrix <- cor(an[, c("Age", "Salary", "Engagement_c")]); dimnames(cor_matrix) <- list(unname(nom_q), unname(nom_q))
+print(round(cor_matrix, 4))
+png("figs/fCorr.png", width = 1000, height = 900, res = 200)
+corrplot(cor_matrix, method = "color", type = "upper", tl.cex = 0.9, addCoef.col = "black"); invisible(dev.off())
+corrplot(cor_matrix, method = "color", type = "upper", tl.cex = 0.8, addCoef.col = "black")
+
+res_cor <- bind_rows(lapply(pares, function(p) {
+  d <- datos[complete.cases(datos[, p]), p]; ct <- cor.test(d[[1]], d[[2]])
+  data.frame(Par = paste(nom_q[[p[1]]], "y", nom_q[[p[2]]]), n = nrow(d), pearson = unname(ct$estimate),
+             spearman = cor(d[[1]], d[[2]], method = "spearman"), p = ct$p.value, stringsAsFactors = FALSE) }))
+res_t <- bind_rows(lapply(c("Age", "Salary", "Engagement_c"), function(v) {
+  d <- data.frame(y = datos[[v]], g = datos$Estado); d <- d[complete.cases(d), ]
+  g1 <- d$y[d$g == "Inactivo"]; g2 <- d$y[d$g == "Activo"]; tt <- t.test(g2, g1)
+  sp <- sqrt(((length(g1) - 1) * var(g1) + (length(g2) - 1) * var(g2)) / (length(g1) + length(g2) - 2))
+  data.frame(Variable = nom_q[[v]], m_in = mean(g1), m_ac = mean(g2), dif = mean(g2) - mean(g1),
+             d = (mean(g2) - mean(g1)) / sp, p = tt$p.value, stringsAsFactors = FALSE) }))
+p_adj <- p.adjust(c(res_chi$p, res_t$p, res_cor$p), method = "holm")
+k1 <- nrow(res_chi); k2 <- nrow(res_t); k3 <- nrow(res_cor)
+res_chi$p_adj <- p_adj[seq_len(k1)]; res_t$p_adj <- p_adj[k1 + seq_len(k2)]; res_cor$p_adj <- p_adj[k1 + k2 + seq_len(k3)]
+n_sig_biv <- sum(p_adj < ALPHA)
+dif_eng_max <- max(sapply(c("Subscription_Tier", "Gender", "City"), function(v) diff(range(tapply(datos$Engagement_c, datos[[v]], mean, na.rm = TRUE)))))
+```
+
+```{r tBivariadas}
+tc <- data.frame(Variable = res_chi$Variable, gl = fmt(res_chi$gl, 0), `Chi-cuadrado` = fmt(res_chi$chi2, 2), p = fp(res_chi$p),
+                 `p (Holm)` = fp(res_chi$p_adj), `V de Cramér` = fmt(res_chi$V, 4),
+                 `% activos (mín-máx)` = paste0(fmt(res_chi$pmin, 1), "-", fmt(res_chi$pmax, 1)), check.names = FALSE)
+tabla(tc, "tChi")
+tt <- data.frame(Variable = res_t$Variable, `Media inactivos` = fmt(res_t$m_in, 2), `Media activos` = fmt(res_t$m_ac, 2),
+                 Diferencia = fmt(res_t$dif, 2), `d de Cohen` = fmt(res_t$d, 4), p = fp(res_t$p), `p (Holm)` = fp(res_t$p_adj), check.names = FALSE)
+tabla(tt, "tTtest")
+tr1 <- data.frame(Par = res_cor$Par, n = fmt(res_cor$n, 0), Pearson = fmt(res_cor$pearson, 4), Spearman = fmt(res_cor$spearman, 4),
+                  p = fp(res_cor$p), `p (Holm)` = fp(res_cor$p_adj), check.names = FALSE)
+tabla(tr1, "tCor")
+
+mac("rSigBivTxt", ifelse(n_sig_biv == 0, paste0("Ninguna de las ", k1 + k2 + k3, " pruebas bivariadas resulta significativa tras el ajuste de Holm"),
+                         paste0(n_sig_biv, " de las ", k1 + k2 + k3, " pruebas bivariadas resultan significativas tras el ajuste de Holm")))
+mac("rPminAct", fpct(min(res_chi$pmin))); mac("rPmaxAct", fpct(max(res_chi$pmax)))
+mac("rVmax", fmt(max(res_chi$V), 4)); mac("rVlab", lab_V(max(res_chi$V)))
+mac("rDlab", lab_d(max(abs(res_t$d)))); mac("rDmax", fmt(max(abs(res_t$d)), 4))
+mac("rRtxt", ifelse(max(abs(res_cor$pearson)) < .1, "prácticamente nulas", "de magnitud variable")); mac("rRmax", fmt(max(abs(res_cor$pearson)), 4))
+mac("rDifEngMax", fmt(dif_eng_max, 2))
+```
+
+## Descriptivo: cualitativas frente a cuantitativas
+
+```{r catCuant}
+combos <- list(c("Subscription_Tier", "Engagement_c", "Tier"), c("Gender", "Engagement_c", "Gender"), c("City", "Engagement_c", "City"),
+               c("Age_Group", "Engagement_c", "AgeGroup"), c("Estado", "Salary", "EstadoSal"))
+for (par in combos) {
+  cat_var <- par[1]; num_var <- par[2]
+  resumen <- datos %>% filter(!is.na(.data[[cat_var]]), !is.na(.data[[num_var]])) %>% group_by(Categoria = .data[[cat_var]]) %>%
+    summarise(n = n(), media = mean(.data[[num_var]]), mediana = median(.data[[num_var]]), sd = sd(.data[[num_var]]),
+              min = min(.data[[num_var]]), max = max(.data[[num_var]]), .groups = "drop") %>%
+    mutate(across(where(is.numeric), ~ round(.x, 2)))
+  print(kable(resumen, caption = paste("Resumen de", num_var, "por", cat_var)))
+  dd <- m100 %>% filter(!is.na(.data[[cat_var]]), !is.na(.data[[num_var]]))
+  print(fig(ggplot(dd, aes(x = .data[[cat_var]], y = .data[[num_var]])) +
+              geom_boxplot(fill = "lightblue", alpha = 0.7, outlier.size = 0.4, outlier.alpha = 0.3) +
+              labs(title = paste(num_var, "por", cat_var), x = NULL, y = num_var) +
+              theme(axis.text.x = element_text(angle = if (cat_var == "City") 30 else 0, hjust = if (cat_var == "City") 1 else 0.5)),
+            paste0("fBox", par[3]), 3.4, 3))
+  if (n_distinct(dd[[cat_var]]) <= 10)
+    print(fig(ggplot(dd, aes(x = .data[[num_var]], color = .data[[cat_var]])) + geom_density(linewidth = 1) +
+                labs(title = paste("Densidad de", num_var), x = num_var, color = cat_var), paste0("fDens", par[3]), 3.4, 3))
+}
+```
+
+## Bondad de ajuste
+
+```{r bondad}
+chi_unif <- function(v) { tb <- table(datos[[v]]); ct <- chisq.test(tb, p = rep(1 / length(tb), length(tb)))
+  data.frame(Variable = v, gl = unname(ct$parameter), chi2 = unname(ct$statistic), p = ct$p.value) }
+bondad <- bind_rows(chi_unif("Gender"), chi_unif("City"))
+age_tb <- table(datos$Age); ct_age <- chisq.test(age_tb, p = rep(1 / length(age_tb), length(age_tb)))
+bondad <- bind_rows(bondad, data.frame(Variable = "Age (cada edad)", gl = unname(ct_age$parameter), chi2 = unname(ct_age$statistic), p = ct_age$p.value))
+tabla(data.frame(`Variable (H0: categorías equiprobables)` = bondad$Variable, gl = fmt(bondad$gl, 0), `Chi-cuadrado` = fmt(bondad$chi2, 2),
+                 p = fp(bondad$p), check.names = FALSE), "tBondad")
+
+obs_vs_esp <- bind_rows(lapply(c("Gender", "City"), function(v) { tb <- table(datos[[v]])
+  data.frame(Variable = v, Categoria = names(tb), Observada = as.numeric(tb), Esperada = sum(tb) / length(tb)) })) %>%
+  pivot_longer(c(Observada, Esperada), names_to = "Tipo", values_to = "Frecuencia")
+fig(ggplot(obs_vs_esp, aes(x = Categoria, y = Frecuencia, fill = Tipo)) + geom_bar(stat = "identity", position = "dodge") +
+      facet_wrap(~Variable, scales = "free_x") + scale_y_continuous(labels = lbl_num) +
+      scale_fill_manual(values = c(Observada = COL2, Esperada = "lightblue")) +
+      labs(title = "Frecuencia observada vs. esperada (uniforme)", x = NULL, y = "Frecuencia") +
+      theme(axis.text.x = element_text(angle = 30, hjust = 1)), "fObsEsp", 7, 3)
+
+x_s <- sample(na.omit(datos$Engagement_Score), 5000)
+ks_e <- ks.test(x_s, "pnorm", mean = mean(x_s), sd = sd(x_s)); sw_e <- shapiro.test(x_s)
+fig(ggplot(data.frame(x = x_s), aes(x = x)) + geom_histogram(aes(y = after_stat(density)), bins = 30, fill = COL1, colour = "white") +
+      stat_function(fun = dnorm, args = list(mean = mean(x_s), sd = sd(x_s)), colour = COL2, linewidth = 1) +
+      labs(title = "Engagement vs. curva normal", x = "Engagement Score", y = "Densidad"), "fNormEng", 3.4, 3)
+fig(ggplot(data.frame(x = x_s), aes(sample = x)) + stat_qq(alpha = 0.4, color = COL1) + stat_qq_line(color = COL2) +
+      labs(title = "Cuantil-cuantil del engagement", x = "Cuantiles teóricos", y = "Cuantiles muestrales"), "fQQEng", 3.4, 3)
+sal_s <- sample(na.omit(datos$Salary), 5000)
+ks_s <- suppressWarnings(ks.test(sal_s, "punif", min(datos$Salary, na.rm = TRUE), max(datos$Salary, na.rm = TRUE)))
+
+mac("rBondadTxt", ifelse(all(bondad$p[1:2] >= ALPHA), "son compatibles con categorías equiprobables", "no son compatibles con categorías equiprobables"))
+mac("rPks", fp(ks_e$p.value)); mac("rPsw", fp(sw_e$p.value)); mac("rPunifSal", fp(ks_s$p.value))
+mac("rNormTxt", ifelse(min(ks_e$p.value, sw_e$p.value) >= ALPHA, "por lo que no se rechaza la normalidad",
+                       "por lo que se rechaza la normalidad estricta, aunque el gráfico cuantil-cuantil muestra qué tan cerca está"))
+```
+
+## Modelos: ANOVA, regresión lineal, regresión logística y supuestos
+
+```{r modelos}
+# ---- ANOVA (Objetivo 1) ----
+fac_aov <- c(Subscription_Tier = "Suscripción", Gender = "Género", City = "Ciudad", Age_Group = "Grupo de edad", Salary_Level = "Nivel salarial")
+res_aov <- bind_rows(lapply(names(fac_aov), function(v) {
+  d <- data.frame(y = datos$Engagement_c, g = datos[[v]]); d <- d[complete.cases(d), ]
+  s <- summary(aov(y ~ g, data = d))[[1]]
+  data.frame(Factor = unname(fac_aov[v]), gl1 = s$Df[1], gl2 = s$Df[2], F = s[["F value"]][1], p = s[["Pr(>F)"]][1],
+             eta2 = s[["Sum Sq"]][1] / sum(s[["Sum Sq"]]), stringsAsFactors = FALSE) }))
+res_aov$p_holm <- p.adjust(res_aov$p, method = "holm")
+sig_aov <- res_aov$Factor[res_aov$p_holm < ALPHA]
+a_tier <- aov(Engagement_c ~ Subscription_Tier, data = an)
+tuk <- tidy(TukeyHSD(a_tier))
+lev <- leveneTest(Engagement_c ~ Subscription_Tier, data = an)
+bart <- bartlett.test(Engagement_c ~ Subscription_Tier, data = an)
+sh_a <- shapiro.test(sample(residuals(a_tier), 5000))
+kw <- kruskal.test(Engagement_c ~ Subscription_Tier, data = an)
+m_2f <- lm(Engagement_c ~ Subscription_Tier * Gender, data = an)
+a2f <- as.data.frame(Anova(m_2f, type = "II")); p_inter <- a2f[["Pr(>F)"]][3]
+
+# ---- Regresión lineal (Objetivo 2) ----
+form_lm <- Engagement_c ~ Subscription_Tier + Age10 + Sal10k + Gender + City
+m_lm <- lm(form_lm, data = an); s_lm <- summary(m_lm); fs_lm <- s_lm$fstatistic
+p_lm <- unname(pf(fs_lm[1], fs_lm[2], fs_lm[3], lower.tail = FALSE))
+av <- as.data.frame(Anova(m_lm, type = "II")); av_t <- av[rownames(av) != "Residuals", , drop = FALSE]
+av_t$eta2p <- av_t[["Sum Sq"]] / (av_t[["Sum Sq"]] + av["Residuals", "Sum Sq"])
+av_t$p_holm <- p.adjust(av_t[["Pr(>F)"]], method = "holm")
+lab_term <- c(Subscription_Tier = "Suscripción", Age10 = "Edad", Sal10k = "Salario", Gender = "Género", City = "Ciudad")
+sig_lm <- unname(lab_term[rownames(av_t)[av_t$p_holm < ALPHA]])
+lab_coef <- function(x) { x <- sub("^\\(Intercept\\)$", "Intercepto", x); x <- sub("^Age10$", "Edad (+10 años)", x)
+  x <- sub("^Sal10k$", "Salario (+10.000 USD)", x); x <- sub("^Subscription_Tier", "Suscripción: ", x)
+  x <- sub("^Eng10$", "Engagement (+10 puntos)", x); sub("^Gender", "Género: ", x) }
+cf_tab <- tidy(m_lm, conf.int = TRUE) %>% filter(!grepl("^City", term)) %>% mutate(Termino = lab_coef(term))
+
+# ---- Diagnósticos (submuestras) ----
+sub_r <- an %>% slice_sample(n = min(n_an, 50000)); sub_o <- an %>% arrange(ID) %>% slice_head(n = min(n_an, 50000))
+m_sr <- lm(form_lm, data = sub_r); m_so <- lm(form_lm, data = sub_o)
+res_s <- residuals(m_sr); fit_s <- fitted(m_sr)
+sh <- shapiro.test(sample(res_s, 5000))
+bp_aux <- lm(I(res_s^2 / mean(res_s^2)) ~ Subscription_Tier + Age10 + Sal10k + Gender + City, data = sub_r)
+bp_stat <- nrow(sub_r) * summary(bp_aux)$r.squared; bp_gl <- length(coef(m_sr)) - 1
+bp_p <- pchisq(bp_stat, bp_gl, lower.tail = FALSE)
+res_o <- residuals(m_so); dw <- sum(diff(res_o)^2) / sum(res_o^2)
+dw_p <- 2 * pnorm(-abs((dw - 2) / (2 / sqrt(length(res_o)))))
+sub_r$f2 <- fit_s^2; sub_r$f3 <- fit_s^3
+rs_p <- anova(m_sr, lm(update(form_lm, . ~ . + f2 + f3), data = sub_r))[["Pr(>F)"]][2]
+vif_l <- vif(m_lm); max_vif_l <- max(if (is.matrix(vif_l)) vif_l[, ncol(vif_l)] else sqrt(vif_l))
+
+# ---- Regresión logística (Objetivo 3) ----
+form_log <- Act ~ Eng10 + Subscription_Tier + Age10 + Sal10k + Gender + City
+m0 <- glm(Act ~ 1, family = binomial, data = an); m1 <- glm(form_log, family = binomial, data = an)
+lr <- anova(m0, m1, test = "Chisq"); lr_chi <- lr$Deviance[2]; lr_df <- lr$Df[2]; lr_p <- lr[["Pr(>Chi)"]][2]
+ll0 <- as.numeric(logLik(m0)); ll1 <- as.numeric(logLik(m1))
+mcf <- 1 - ll1 / ll0; nag <- (1 - exp((2 / n_an) * (ll0 - ll1))) / (1 - exp((2 / n_an) * ll0))
+d1g <- as.data.frame(drop1(m1, test = "Chisq")); d1g <- d1g[rownames(d1g) != "<none>", ]
+lab_term_g <- c(Eng10 = "Engagement Score", lab_term)
+d1g$p_holm <- p.adjust(d1g[["Pr(>Chi)"]], method = "holm")
+sig_log <- unname(lab_term_g[rownames(d1g)[d1g$p_holm < ALPHA]])
+co <- summary(m1)$coefficients; ci <- confint.default(m1)
+or_tab <- data.frame(raw = rownames(co), OR = exp(co[, 1]), LI = exp(ci[, 1]), LS = exp(ci[, 2]), p = co[, 4], stringsAsFactors = FALSE)
+or_tab <- or_tab[or_tab$raw != "(Intercept)" & !grepl("^City", or_tab$raw), ]; or_tab$Termino <- lab_coef(or_tab$raw)
+or_eng <- exp(c(coef(m1)["Eng10"], ci["Eng10", ])); or_eng_p <- co["Eng10", 4]
+
+idx_tr <- sample(n_an, floor(0.7 * n_an)); tr <- an[idx_tr, ]; te <- an[-idx_tr, ]
+mt <- glm(form_log, family = binomial, data = tr); te$pr <- predict(mt, newdata = te, type = "response")
+auc_f <- function(y, p) { r <- rank(p); n1 <- as.numeric(sum(y == 1)); n0 <- as.numeric(sum(y == 0)); (sum(r[y == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0) }
+auc <- auc_f(te$Act, te$pr)
+thr <- mean(tr$Act); cl <- as.integer(te$pr >= thr)
+acc <- mean(cl == te$Act); base_acc <- max(mean(te$Act), 1 - mean(te$Act))
+sens <- mean(cl[te$Act == 1] == 1); espe <- mean(cl[te$Act == 0] == 0)
+auc_lab <- ifelse(auc < .55, "prácticamente nula (similar al azar)", ifelse(auc < .65, "baja", ifelse(auc < .75, "modesta", "aceptable o superior")))
+th <- sort(unique(quantile(te$pr, probs = seq(0, 1, length.out = 201))))
+roc_df <- data.frame(fpr = sapply(th, function(t) mean(te$pr[te$Act == 0] >= t)), tpr = sapply(th, function(t) mean(te$pr[te$Act == 1] >= t)))
+cal <- te %>% mutate(dec = ntile(pr, 10)) %>% group_by(dec) %>% summarise(pred = mean(pr), obs = mean(Act), .groups = "drop")
+
+epv <- min(sum(an$Act), sum(1 - an$Act)) / (length(coef(m1)) - 1)
+vif_g <- vif(m1); max_vif_g <- max(if (is.matrix(vif_g)) vif_g[, ncol(vif_g)] else sqrt(vif_g))
+m_cuad <- update(m1, . ~ . + I(Eng10^2) + I(Age10^2) + I(Sal10k^2))
+p_lin <- anova(m1, m_cuad, test = "Chisq")[["Pr(>Chi)"]][2]
+cdl_max <- max(cooks.distance(glm(form_log, family = binomial, data = sub_r)))
+
+# ---- Sensibilidad ----
+m_raw <- glm(Act ~ I(Engagement_Score / 10) + Subscription_Tier + Age10 + Sal10k + Gender + City, family = binomial, data = an)
+imp <- datos
+imp$Age[is.na(imp$Age)] <- median(datos$Age, na.rm = TRUE); imp$Salary[is.na(imp$Salary)] <- median(datos$Salary, na.rm = TRUE)
+imp$Engagement_c[is.na(imp$Engagement_c)] <- median(datos$Engagement_c, na.rm = TRUE)
+imp$City <- factor(ifelse(is.na(imp$City), "Desconocida", as.character(imp$City)))
+imp <- imp %>% filter(!is.na(Gender), !is.na(Subscription_Tier), !is.na(Estado)) %>% mutate(Age10 = Age / 10, Sal10k = Salary / 10000, Eng10 = Engagement_c / 10)
+m_imp <- glm(form_log, family = binomial, data = imp)
+or3 <- c(Base = unname(exp(coef(m1)["Eng10"])), `Sin truncar` = unname(exp(coef(m_raw)[2])), `Con imputación` = unname(exp(coef(m_imp)["Eng10"])))
+```
+
+## Tabla de supuestos
+
+```{r tSupuestos}
+ok <- function(cond) ifelse(cond, "Se cumple", "No se cumple")
+sup <- data.frame(
+  Modelo = c("ANOVA", "ANOVA", "ANOVA", rep("Lineal", 5), rep("Logístico", 4)),
+  Supuesto = c("Normalidad de residuos", "Homogeneidad de varianzas", "Independencia", "Normalidad de residuos", "Homocedasticidad",
+               "Independencia de errores", "Linealidad / especificación", "Ausencia de multicolinealidad", "Eventos por parámetro",
+               "Ausencia de multicolinealidad", "Linealidad del logit", "Observaciones influyentes"),
+  Evidencia = c(paste0("Shapiro-Wilk (n = 5.000): p = ", fp(sh_a$p.value)),
+                paste0("Levene p = ", fp(lev[["Pr(>F)"]][1]), "; Bartlett p = ", fp(bart$p.value)),
+                "Un registro por cliente (ID único)", paste0("Shapiro-Wilk (n = 5.000): p = ", fp(sh$p.value)),
+                paste0("Breusch-Pagan: p = ", fp(bp_p)), paste0("Durbin-Watson = ", fmt(dw, 3), " (p = ", fp(dw_p), ")"),
+                paste0("RESET: p = ", fp(rs_p)), paste0("GVIF^(1/2gl) máx. = ", fmt(max_vif_l, 3), " (umbral 2,24)"),
+                paste0("Eventos por parámetro = ", fmt(epv, 0), " (regla: 10)"), paste0("GVIF^(1/2gl) máx. = ", fmt(max_vif_g, 3), " (umbral 2,24)"),
+                paste0("RV términos cuadráticos: p = ", fp(p_lin)), paste0("Cook máx. = ", fmt(cdl_max, 5))),
+  Conclusión = c(ok(sh_a$p.value >= ALPHA), ok(lev[["Pr(>F)"]][1] >= ALPHA && bart$p.value >= ALPHA), "Se asume por diseño",
+                 ok(sh$p.value >= ALPHA), ok(bp_p >= ALPHA), ok(dw_p >= ALPHA), ok(rs_p >= ALPHA), ok(max_vif_l < sqrt(5)),
+                 ok(epv >= 10), ok(max_vif_g < sqrt(5)), ok(p_lin >= ALPHA), ok(cdl_max < 1)), stringsAsFactors = FALSE)
+n_inc <- sum(sup$Conclusión == "No se cumple")
+mac("rSupTxt", ifelse(n_inc == 0, "Todos los supuestos evaluados se cumplen", paste0("Se identificaron ", n_inc, " supuesto(s) no satisfecho(s)")))
+mac("rSupLim", ifelse(n_inc == 0, "", " sus implicaciones se discuten en las limitaciones."))
+tabla(sup, "tSupuestos", "lp{3.4cm}p{5.3cm}l")
+```
+
+## Objetivo 1: ANOVA
+
+```{r obj1}
+ta <- data.frame(Factor = res_aov$Factor, gl = paste0(res_aov$gl1, "; ", fmt(res_aov$gl2, 0)), F = fmt(res_aov$F, 3), p = fp(res_aov$p),
+                 `p (Holm)` = fp(res_aov$p_holm), `Eta cuadrado` = fmt(res_aov$eta2, 6), check.names = FALSE)
+tabla(ta, "tAov")
+
+medias <- bind_rows(lapply(names(fac_aov), function(v) {
+  data.frame(y = an$Engagement_c, g = an[[v]]) %>% group_by(Categoria = as.character(g)) %>%
+    summarise(media = mean(y), se = sd(y) / sqrt(n()), .groups = "drop") %>%
+    mutate(lo = media - 1.96 * se, hi = media + 1.96 * se, Factor = unname(fac_aov[v])) }))
+fig(ggplot(medias, aes(x = Categoria, y = media)) + geom_pointrange(aes(ymin = lo, ymax = hi), color = COL1, size = 0.3) +
+      geom_hline(yintercept = mean(an$Engagement_c), linetype = "dashed", color = COL2) + facet_wrap(~Factor, scales = "free_x") +
+      labs(title = "Engagement medio por categoría (IC 95%)", x = NULL, y = "Engagement") +
+      theme(axis.text.x = element_text(angle = 40, hjust = 1, size = 7)), "fAovMedias", 7, 3.6)
+
+tk <- tuk %>% transmute(Contraste = contrast, Diferencia = fmt(estimate, 4), `IC inf.` = fmt(conf.low, 4), `IC sup.` = fmt(conf.high, 4), `p ajustado` = fp(adj.p.value))
+tabla(tk, "tTukey")
+
+a2 <- a2f[rownames(a2f) != "Residuals", ]
+tabla(data.frame(Término = rownames(a2), gl = fmt(a2$Df, 0), F = fmt(a2[["F value"]], 3), p = fp(a2[["Pr(>F)"]])), "tAov2")
+
+inter <- an %>% group_by(Subscription_Tier, Gender) %>% summarise(media = mean(Engagement_c), .groups = "drop")
+fig(ggplot(inter, aes(x = Subscription_Tier, y = media, color = Gender, group = Gender)) + geom_line(linewidth = 1) + geom_point(size = 2) +
+      labs(title = "Interacción suscripción por género", x = "Suscripción", y = "Engagement medio", color = "Género"), "fInter", 3.4, 3)
+
+mac("rSigAovTxt", ifelse(length(sig_aov) == 0, "Ningún factor presenta diferencias significativas en el engagement medio tras el ajuste de Holm",
+                         paste0("Presentan diferencias significativas en el engagement medio: ", lista(sig_aov))))
+mac("rEtaMax", fmt(max(res_aov$eta2), 6)); mac("rEtaLab", lab_eta(max(res_aov$eta2)))
+mac("rTukDif", fmt(max(abs(tuk$estimate)), 3)); mac("rTukP", fp(min(tuk$adj.p.value)))
+mac("rKwP", fp(kw$p.value)); mac("rInterP", fp(p_inter))
+mac("rDecAov", ifelse(length(sig_aov) == 0, "no se rechaza H0 en ningún factor", paste0("se rechaza H0 en: ", lista(sig_aov))))
+mac("rConclAov", ifelse(length(sig_aov) == 0, "No se hallaron diferencias significativas del engagement entre los grupos de ningún factor.",
+                        paste0("Hay diferencias significativas del engagement según: ", lista(sig_aov), ", aunque de magnitud pequeña.")))
+```
+
+## Objetivo 2: regresión lineal múltiple
+
+```{r obj2}
+cf_o <- cf_tab %>% transmute(Término = Termino, Coeficiente = fmt(estimate, 4), `IC 95%` = paste0("[", fmt(conf.low, 4), "; ", fmt(conf.high, 4), "]"), p = fp(p.value))
+tabla(cf_o, "tLmCoef")
+mac("rRefs", paste0("Basic, ", levels(an$Gender)[1], " y ", levels(an$City)[1]))
+tm <- data.frame(Término = unname(lab_term[rownames(av_t)]), gl = fmt(av_t$Df, 0), F = fmt(av_t[["F value"]], 3), p = fp(av_t[["Pr(>F)"]]),
+                 `p (Holm)` = fp(av_t$p_holm), `Eta cuadrado parcial` = fmt(av_t$eta2p, 6), check.names = FALSE)
+tabla(tm, "tLmAnova")
+
+k5 <- sample(length(res_s), 5000); dg <- data.frame(fit = fit_s[k5], res = res_s[k5])
+fig(ggplot(dg, aes(x = fit, y = res)) + geom_point(alpha = 0.35, size = 0.5, color = COL1) + geom_hline(yintercept = 0, color = COL2, linetype = "dashed") +
+      labs(title = "Residuos vs. ajustados", x = "Ajustados", y = "Residuos"), "fDiagRes", 3.2, 2.8)
+fig(ggplot(dg, aes(sample = res)) + stat_qq(alpha = 0.4, size = 0.5, color = COL1) + stat_qq_line(color = COL2) +
+      labs(title = "Cuantil-cuantil", x = "Teóricos", y = "Muestrales"), "fDiagQQ", 3.2, 2.8)
+fig(ggplot(data.frame(res = res_s), aes(x = res)) + geom_histogram(aes(y = after_stat(density)), bins = 40, fill = COL1, colour = "white") +
+      stat_function(fun = dnorm, args = list(mean = mean(res_s), sd = sd(res_s)), colour = COL2, linewidth = 1) +
+      labs(title = "Histograma de residuos", x = "Residuos", y = "Densidad"), "fDiagHist", 3.2, 2.8)
+
+mac("rRdos", fpct(100 * s_lm$r.squared, 3)); mac("rRajust", fmt(s_lm$adj.r.squared, 5)); mac("rPlm", fp(p_lm))
+mac("rSigLm", lista(sig_lm)); mac("rEtaPmax", fmt(max(av_t$eta2p), 6)); mac("rEtaPlab", lab_eta(max(av_t$eta2p)))
+mac("rEtaPlabPl", paste0(lab_eta(max(av_t$eta2p)), "s"))
+mac("rBetaAge", fmt(cf_tab$estimate[cf_tab$term == "Age10"], 3)); mac("rBetaAgeLo", fmt(cf_tab$conf.low[cf_tab$term == "Age10"], 3))
+mac("rBetaAgeHi", fmt(cf_tab$conf.high[cf_tab$term == "Age10"], 3))
+```
+
+## Objetivo 3: regresión logística
+
+```{r obj3}
+tl <- data.frame(Término = unname(lab_term_g[rownames(d1g)]), gl = fmt(d1g$Df, 0), `Chi-cuadrado (RV)` = fmt(d1g$LRT, 2), p = fp(d1g[["Pr(>Chi)"]]),
+                 `p (Holm)` = fp(d1g$p_holm), check.names = FALSE)
+tabla(tl, "tLogLRT")
+to <- data.frame(Término = or_tab$Termino, `Odds ratio` = fmt(or_tab$OR, 4), `IC 95%` = paste0("[", fmt(or_tab$LI, 4), "; ", fmt(or_tab$LS, 4), "]"),
+                 p = fp(or_tab$p), check.names = FALSE)
+tabla(to, "tOR")
+
+cm <- table(factor(ifelse(te$Act == 1, "Activo", "Inactivo"), levels = c("Inactivo", "Activo")), factor(ifelse(cl == 1, "Activo", "Inactivo"), levels = c("Inactivo", "Activo")))
+tabla(data.frame(`Observado / Predicho` = rownames(cm), Inactivo = fmt(cm[, "Inactivo"], 0), Activo = fmt(cm[, "Activo"], 0), check.names = FALSE), "tConf")
+
+fig(ggplot(roc_df, aes(x = fpr, y = tpr)) + geom_line(color = COL1, linewidth = 1) + geom_abline(linetype = "dashed", color = "grey40") + coord_equal() +
+      labs(title = paste0("Curva ROC (AUC = ", fmt(auc, 3), ")"), x = "1 - Especificidad", y = "Sensibilidad"), "fROC", 3.2, 3.2)
+lim <- range(c(cal$pred, cal$obs)) + c(-0.01, 0.01)
+fig(ggplot(cal, aes(x = pred, y = obs)) + geom_abline(linetype = "dashed", color = "grey40") + geom_point(color = COL2, size = 2.5) +
+      coord_equal(xlim = lim, ylim = lim) + scale_x_continuous(labels = scales::percent) + scale_y_continuous(labels = scales::percent) +
+      labs(title = "Calibración por deciles", x = "Probabilidad predicha", y = "Proporción observada"), "fCal", 3.2, 3.2)
+
+mac("rLrTxt", ifelse(lr_p < ALPHA, "mejora de forma estadísticamente significativa", "no mejora de forma estadísticamente significativa"))
+mac("rLrChi", fmt(lr_chi, 2)); mac("rLrDf", lr_df); mac("rLrP", fp(lr_p)); mac("rMcf", fmt(mcf, 5)); mac("rNag", fmt(nag, 5))
+mac("rSigLog", lista(sig_log))
+mac("rOrEng", fmt(or_eng[1], 3)); mac("rOrEngLo", fmt(or_eng[2], 3)); mac("rOrEngHi", fmt(or_eng[3], 3)); mac("rOrEngP", fp(or_eng_p))
+mac("rAuc", fmt(auc, 3)); mac("rAucLab", auc_lab); mac("rAcc", fpct(100 * acc)); mac("rSens", fpct(100 * sens)); mac("rEspe", fpct(100 * espe))
+mac("rBaseAcc", fpct(100 * base_acc))
+mac("rOrBase", fmt(or3["Base"], 3)); mac("rOrRaw", fmt(or3["Sin truncar"], 3)); mac("rOrImp", fmt(or3["Con imputación"], 3)); mac("rNimp", fmt(nrow(imp), 0))
+mac("rSensTxt", ifelse(max(abs(or3 - or3["Base"])) < 0.01, "es decir, las conclusiones no dependen del tratamiento de los valores atípicos ni de los faltantes",
+                       "lo que sugiere cierta sensibilidad al tratamiento de los datos"))
+```
+
+## Objetivo general
+
+```{r objGeneral}
+std_data <- an %>% mutate(across(c(Engagement_c, Age, Salary), ~ as.numeric(scale(.x))))
+mod_std <- lm(Engagement_c ~ Age + Salary + Subscription_Tier + Gender + City, data = std_data)
+beta_tab <- tidy(mod_std) %>% filter(term %in% c("Age", "Salary")) %>%
+  transmute(Variable = c(Age = "Edad", Salary = "Salario")[term], `Beta estandarizado` = fmt(estimate, 5), est = estimate) %>%
+  arrange(desc(abs(est))) %>% select(-est)
+tabla(beta_tab, "tBeta")
+
+resumen_h <- bind_rows(
+  data.frame(Objetivo = "1. ANOVA", Término = res_aov$Factor, Efecto = res_aov$eta2, p_holm = res_aov$p_holm, Medida = "eta²"),
+  data.frame(Objetivo = "2. Regresión lineal", Término = unname(lab_term[rownames(av_t)]), Efecto = av_t$eta2p, p_holm = av_t$p_holm, Medida = "eta² parcial"),
+  data.frame(Objetivo = "3. Regresión logística", Término = unname(lab_term_g[rownames(d1g)]), Efecto = NA_real_, p_holm = d1g$p_holm, Medida = "RV")) %>%
+  transmute(Objetivo, Término, `Tamaño del efecto` = ifelse(is.na(Efecto), "ver razones de odds", paste0(Medida, " = ", fmt(Efecto, 6))),
+            `p (Holm)` = fp(p_holm), Decisión = ifelse(p_holm < ALPHA, "Rechaza H0", "No rechaza H0"))
+tabla(resumen_h, "tResumen", "llrrl")
+```
+
+## Exportar números a LaTeX
+
+```{r exportar}
+writeLines(c("% Generado automáticamente por Codigo_Analisis.Rmd. No editar a mano.",
+             sprintf("\\newcommand{\\%s}{%s}", names(MAC), unlist(MAC))), "resultados.tex", useBytes = FALSE)
+cat("Macros escritas:", length(MAC), "\nFiguras:", length(list.files("figs")), "| Tablas:", length(list.files("tablas")), "\n")
+```
